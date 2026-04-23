@@ -1,0 +1,17 @@
+[Unit]
+Description=InteligenAI HRMS Auto-Checkout
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hrms-checkout
+EnvironmentFile=/opt/hrms-checkout/.env
+ExecStart=/opt/hrms-checkout/.venv/bin/python auto_checkout.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+playwright==1.58.*
+python-telegram-bot==21.*
+schedule==1.2.*
+python-dotenv==1.0.*
