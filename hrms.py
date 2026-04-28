@@ -10,8 +10,10 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from playwright.sync_api import (
+    BrowserContext,
     Page,
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
@@ -20,6 +22,24 @@ from playwright.sync_api import (
 from config import Config
 
 log = logging.getLogger(__name__)
+
+SessionHealth = Literal["healthy", "expired", "error"]
+
+
+def _on_login_page(url: str) -> bool:
+    return "/login" in url or "login.microsoftonline.com" in url
+
+
+def _persist_storage_state(context: BrowserContext, cfg: Config) -> None:
+    """Save rotated cookies back to disk so the next run starts from the
+    freshest session. Skip silently on error — losing one rotation is
+    not worth crashing the run."""
+    try:
+        cfg.auth_state_path.parent.mkdir(parents=True, exist_ok=True)
+        context.storage_state(path=str(cfg.auth_state_path))
+        log.debug("auth_state.json refreshed")
+    except Exception as e:
+        log.warning("Could not refresh auth_state.json: %s", e)
 
 # Tried in order; first visible match wins.
 CLOCK_OUT_SELECTORS = (
@@ -76,13 +96,16 @@ def perform_checkout(cfg: Config, out_time: str | None = None) -> tuple[bool, st
 
             current_url = page.url
             log.info("Landed on: %s", current_url)
-            if "/login" in current_url or "login.microsoftonline.com" in current_url:
+            if _on_login_page(current_url):
                 _screenshot(page, cfg.screenshot_dir, "session_expired")
                 return (
                     False,
                     "Session expired. Re-run setup_session.py on a machine with a "
                     "display, then copy the new auth_state.json to this host.",
                 )
+
+            # Past the login redirect — session is alive. Capture rotated cookies.
+            _persist_storage_state(context, cfg)
 
             clicked_selector: str | None = None
             for sel in CLOCK_OUT_SELECTORS:
@@ -171,6 +194,39 @@ def perform_checkout(cfg: Config, out_time: str | None = None) -> tuple[bool, st
             except Exception:
                 pass
             return (False, f"Checkout failed: {type(e).__name__}: {e}")
+        finally:
+            context.close()
+            browser.close()
+
+
+def keep_session_alive(cfg: Config) -> SessionHealth:
+    """Probe the HRMS dashboard headlessly to keep the session warm and
+    detect expiry early. Returns:
+
+      - "healthy"  -> dashboard loaded, storage_state refreshed on disk
+      - "expired"  -> redirected to /login or login.microsoftonline.com
+      - "error"    -> playwright crash, file missing, etc.
+    """
+    if not cfg.auth_state_path.exists():
+        log.info("keep-alive: no auth_state.json yet, skipping probe")
+        return "error"
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=cfg.headless)
+        context = browser.new_context(storage_state=str(cfg.auth_state_path))
+        page = context.new_page()
+        try:
+            page.goto(cfg.hrms_url, wait_until="networkidle", timeout=45_000)
+            current_url = page.url
+            if _on_login_page(current_url):
+                log.info("keep-alive: session expired (landed on %s)", current_url)
+                return "expired"
+            _persist_storage_state(context, cfg)
+            log.info("keep-alive: session healthy")
+            return "healthy"
+        except Exception as e:
+            log.warning("keep-alive: probe error: %s", e)
+            return "error"
         finally:
             context.close()
             browser.close()

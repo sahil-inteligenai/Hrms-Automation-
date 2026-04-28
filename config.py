@@ -34,6 +34,13 @@ class Config:
     reply_timeout_seconds: int
     run_time: str
     headless: bool
+    ms_email: str | None
+    ms_password: str | None
+    keep_alive_interval_hours: int
+
+    @property
+    def reauth_enabled(self) -> bool:
+        return bool(self.ms_email and self.ms_password)
 
 
 def _bool(value: str | None, default: bool) -> bool:
@@ -63,4 +70,7 @@ def load_config() -> Config:
         reply_timeout_seconds=int(os.getenv("REPLY_TIMEOUT_SECONDS", "600")),
         run_time=os.getenv("RUN_TIME", "22:00"),
         headless=_bool(os.getenv("HEADLESS"), True),
+        ms_email=(os.getenv("MS_EMAIL") or None),
+        ms_password=(os.getenv("MS_PASSWORD") or None),
+        keep_alive_interval_hours=int(os.getenv("KEEP_ALIVE_INTERVAL_HOURS", "6")),
     )

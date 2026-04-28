@@ -22,13 +22,14 @@ from datetime import datetime
 import schedule
 
 from config import Config, load_config
-from hrms import perform_checkout
+from hrms import keep_session_alive, perform_checkout
 from notifier import (
     get_latest_update_id,
     send_email,
     send_telegram,
     wait_for_telegram_reply,
 )
+from reauth import refresh_session
 
 log = logging.getLogger("auto_checkout")
 
@@ -55,6 +56,40 @@ def _setup_logging() -> None:
     )
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
+
+
+def run_keep_alive(cfg: Config) -> None:
+    """Probe HRMS to refresh cookies; if expired, attempt automated re-auth."""
+    health = keep_session_alive(cfg)
+    if health == "healthy":
+        return
+    if health == "error":
+        log.warning("keep-alive: probe errored, will retry next cycle")
+        return
+
+    # health == "expired"
+    if not cfg.reauth_enabled:
+        try:
+            send_telegram(
+                cfg,
+                "HRMS session expired. Re-run setup_session.py to refresh "
+                "(or set MS_EMAIL/MS_PASSWORD in .env to enable auto re-auth).",
+            )
+        except Exception as e:
+            log.warning("Could not send expiry alert: %s", e)
+        return
+
+    try:
+        send_telegram(cfg, "HRMS session expired - attempting automatic re-auth.")
+    except Exception as e:
+        log.warning("Could not send pre-reauth alert: %s", e)
+
+    ok, message = refresh_session(cfg)
+    log.info("reauth result: ok=%s msg=%s", ok, message)
+    try:
+        send_telegram(cfg, ("[OK] " if ok else "[FAIL] ") + message)
+    except Exception as e:
+        log.warning("Could not send reauth result: %s", e)
 
 
 def run_workflow(cfg: Config, *, force: bool = False) -> None:
@@ -127,10 +162,24 @@ def main() -> None:
         except Exception:
             log.exception("Workflow crashed (scheduler stays alive)")
 
+    def _keep_alive_job() -> None:
+        try:
+            run_keep_alive(cfg)
+        except Exception:
+            log.exception("Keep-alive crashed (scheduler stays alive)")
+
     schedule.every().day.at(cfg.run_time).do(_job)
+    schedule.every(cfg.keep_alive_interval_hours).hours.do(_keep_alive_job)
+
+    # Run a probe immediately on startup so a stale session isn't carried
+    # all the way to checkout time.
+    _keep_alive_job()
+
     log.info(
-        "Scheduler armed for %s daily (weekdays only). Press Ctrl-C to stop.",
+        "Scheduler armed: checkout %s daily (weekdays); keep-alive every %dh. "
+        "Press Ctrl-C to stop.",
         cfg.run_time,
+        cfg.keep_alive_interval_hours,
     )
 
     while True:
