@@ -29,8 +29,14 @@ log = logging.getLogger(__name__)
 # How long to give the user to approve the push / type the number.
 MFA_WAIT_TIMEOUT_MS = 90_000
 
-# Microsoft's MFA screen uses this id for the displayed number-match digits.
-NUMBER_MATCH_SELECTOR = "#idRichContext_DisplaySign"
+# Microsoft's MFA screen has used several locations for number-match digits
+# across UI revisions. Try them in order.
+NUMBER_MATCH_SELECTORS = (
+    "#idRichContext_DisplaySign",
+    "#displaySign",
+    '[data-testid="displaySign"]',
+    'div[role="heading"]:has-text("Enter the number")',
+)
 
 # "Sign in with Microsoft" button on the HRMS login page.
 HRMS_MS_BUTTON_SELECTORS = (
@@ -66,23 +72,48 @@ def _click_first(page: Page, selectors, timeout: int = 8_000) -> bool:
 
 
 def _scrape_number_match(page: Page) -> str | None:
+    # Wait briefly for the MFA screen to settle so Microsoft has time to
+    # render the displayed number into the DOM.
     try:
-        loc = page.locator(NUMBER_MATCH_SELECTOR).first
-        loc.wait_for(state="visible", timeout=3_000)
-        text = (loc.text_content() or "").strip()
-        if text:
-            return text
+        page.wait_for_load_state("networkidle", timeout=5_000)
     except PlaywrightTimeoutError:
         pass
-    # Fallback: look for an isolated 2-digit number near "Authenticator" text.
-    try:
-        body = page.locator("body").inner_text(timeout=2_000)
-        if "authenticator" in body.lower():
-            m = re.search(r"\b(\d{2})\b", body)
+
+    # 1) Try the explicit element selectors first.
+    for sel in NUMBER_MATCH_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=2_500)
+            text = (loc.text_content() or "").strip()
+            m = re.search(r"\b(\d{2,3})\b", text)
             if m:
                 return m.group(1)
-    except Exception:
-        pass
+            if text:
+                return text
+        except PlaywrightTimeoutError:
+            continue
+
+    # 2) Fallback: scan the visible body text for a 2-digit number that
+    #    appears near Authenticator-related copy. Try the page and any
+    #    iframes (Microsoft's MFA UI sometimes renders inside one).
+    candidates = [page]
+    candidates.extend(page.frames)
+    pat = re.compile(
+        r"(?:enter\s+the\s+number|authenticator).*?(\d{2,3})",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for frame in candidates:
+        try:
+            body = frame.locator("body").inner_text(timeout=2_000)
+        except Exception:
+            continue
+        m = pat.search(body)
+        if m:
+            return m.group(1)
+        if "authenticator" in body.lower():
+            m2 = re.search(r"\b(\d{2,3})\b", body)
+            if m2:
+                return m2.group(1)
     return None
 
 
@@ -141,6 +172,9 @@ def refresh_session(cfg: Config) -> tuple[bool, str]:
 
             # --- MFA step ---
             number = _scrape_number_match(page)
+            # Always dump a screenshot so if the number ever comes back empty
+            # we can see what Microsoft rendered.
+            _screenshot(page, cfg.screenshot_dir, "mfa_screen")
             if number:
                 send_telegram(
                     cfg,
@@ -151,10 +185,11 @@ def refresh_session(cfg: Config) -> tuple[bool, str]:
             else:
                 send_telegram(
                     cfg,
-                    "HRMS re-auth: tap Approve in your Microsoft Authenticator app "
-                    f"within {MFA_WAIT_TIMEOUT_MS // 1000}s.",
+                    "HRMS re-auth: open Authenticator. If it asks for a number, "
+                    "check screenshots/reauth_mfa_screen_*.png on the host - "
+                    f"I couldn't read it. {MFA_WAIT_TIMEOUT_MS // 1000}s window.",
                 )
-                log.info("reauth: push-approve prompt sent to user")
+                log.warning("reauth: number-match could not be scraped; pushed fallback message")
 
             # Wait for navigation off login.microsoftonline.com.
             try:

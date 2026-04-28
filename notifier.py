@@ -9,6 +9,7 @@ import asyncio
 import logging
 import re
 import smtplib
+import threading
 import time
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -20,6 +21,30 @@ from telegram.error import TelegramError
 from config import Config
 
 log = logging.getLogger(__name__)
+
+
+def _run_async(coro):
+    """Run an async coroutine even when called from inside another running
+    event loop (e.g. Playwright's sync API). Always uses a fresh loop in a
+    fresh thread so we never collide with the caller's loop."""
+    result: dict = {}
+
+    def _worker():
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            result["value"] = loop.run_until_complete(coro)
+        except BaseException as e:
+            result["error"] = e
+        finally:
+            loop.close()
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 YES_RE = re.compile(r"^\s*y(es)?\s*$", re.IGNORECASE)
 NO_RE = re.compile(r"^\s*n(o)?\s*$", re.IGNORECASE)
@@ -39,7 +64,7 @@ def send_telegram(cfg: Config, text: str) -> None:
             await bot.send_message(chat_id=cfg.telegram_chat_id, text=text)
 
     try:
-        asyncio.run(_send())
+        _run_async(_send())
         log.info("Telegram sent: %s", text[:80].replace("\n", " "))
     except TelegramError as e:
         log.error("Telegram send failed: %s", e)
@@ -71,7 +96,7 @@ def get_latest_update_id(cfg: Config) -> int:
             updates = await bot.get_updates(timeout=0)
             return updates[-1].update_id if updates else 0
 
-    return asyncio.run(_get())
+    return _run_async(_get())
 
 
 def wait_for_telegram_reply(
@@ -92,7 +117,7 @@ def wait_for_telegram_reply(
 
         long_poll = max(1, min(25, remaining))
         try:
-            updates = asyncio.run(_poll(offset, long_poll))
+            updates = _run_async(_poll(offset, long_poll))
         except TelegramError as e:
             log.warning("getUpdates failed (will retry in 5s): %s", e)
             time.sleep(5)
