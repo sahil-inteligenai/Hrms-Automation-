@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -191,39 +192,63 @@ def refresh_session(cfg: Config) -> tuple[bool, str]:
                 )
                 log.warning("reauth: number-match could not be scraped; pushed fallback message")
 
-            # Wait for navigation off login.microsoftonline.com.
-            try:
-                page.wait_for_url(
-                    re.compile(r"^(?!https://login\.microsoftonline\.com).*"),
-                    timeout=MFA_WAIT_TIMEOUT_MS,
-                )
-            except PlaywrightTimeoutError:
-                _screenshot(page, cfg.screenshot_dir, "mfa_timeout")
+            # Poll the URL rather than relying on wait_for_url with a regex —
+            # Microsoft's post-MFA flow chains through several intermediate
+            # redirects (KMSI page, OAuth callback, then HRMS) and the page
+            # handle can go stale mid-flight if we wait on a single URL match.
+            deadline = time.time() + MFA_WAIT_TIMEOUT_MS / 1000
+            kmsi_clicked = False
+            landed_on_hrms = False
+
+            while time.time() < deadline:
+                try:
+                    current = page.url
+                except Exception:
+                    time.sleep(0.5)
+                    continue
+
+                if current.startswith("https://hrms.inteligenai.com"):
+                    landed_on_hrms = True
+                    break
+
+                # KMSI ("Stay signed in?") — click Yes once if we see it.
+                if not kmsi_clicked and (
+                    "login.microsoftonline.com" in current
+                    or "login.live.com" in current
+                ):
+                    try:
+                        yes_btn = page.locator(
+                            'input[type="submit"][value="Yes"], '
+                            'button:has-text("Yes")'
+                        ).first
+                        yes_btn.wait_for(state="visible", timeout=1_500)
+                        yes_btn.click()
+                        kmsi_clicked = True
+                        log.info("reauth: clicked 'Stay signed in? Yes'")
+                        continue
+                    except PlaywrightTimeoutError:
+                        pass
+                    except Exception as e:
+                        log.debug("KMSI click attempt errored: %s", e)
+
+                time.sleep(1)
+
+            if not landed_on_hrms:
+                try:
+                    final_url = page.url
+                except Exception:
+                    final_url = "<page closed>"
+                _screenshot(page, cfg.screenshot_dir, "post_mfa_unknown")
                 return (
                     False,
-                    f"Re-auth failed: no MFA approval received in "
-                    f"{MFA_WAIT_TIMEOUT_MS // 1000}s.",
+                    f"Re-auth failed: did not land on HRMS within "
+                    f"{MFA_WAIT_TIMEOUT_MS // 1000}s (last URL: {final_url}).",
                 )
 
-            # --- "Stay signed in?" KMSI prompt (sometimes shown) ---
             try:
-                if "login.microsoftonline.com" in page.url or "login.live.com" in page.url:
-                    yes_btn = page.locator(
-                        'input[type="submit"][value="Yes"], button:has-text("Yes")'
-                    ).first
-                    yes_btn.wait_for(state="visible", timeout=5_000)
-                    yes_btn.click()
-            except PlaywrightTimeoutError:
-                pass
-
-            # --- Land on HRMS dashboard ---
-            try:
-                page.wait_for_url(re.compile(r"^https://hrms\.inteligenai\.com/.*"),
-                                  timeout=30_000)
                 page.wait_for_load_state("networkidle", timeout=15_000)
             except PlaywrightTimeoutError:
-                _screenshot(page, cfg.screenshot_dir, "post_mfa_unknown")
-                return (False, f"Re-auth failed: ended on unexpected URL {page.url}.")
+                pass
 
             if "/login" in page.url:
                 _screenshot(page, cfg.screenshot_dir, "post_mfa_back_to_login")
